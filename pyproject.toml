@@ -27,3 +27,6 @@ Issues = "https://github.com/yourname/numpyro-inferutils/issues"
 [tool.hatch.build]
 # include only the src/ tree
 packages = ["src/numpyro_inferutils"]
+
+[project.optional-dependencies]
+test = ["pytest"]
