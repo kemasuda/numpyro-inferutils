@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "numpyro-inferutils"
+version = "0.1.0"
+description = "Utility functions for extracting log-probabilities, parameter transforms, and Fisher information from NumPyro models."
+readme = "README.md"
+authors = [
+  { name = "Kento Masuda", email = "kmasuda@ess.sci.osaka-u.ac.jp" }
+]
+license = { text = "MIT" }
+requires-python = ">=3.10"
+
+dependencies = [
+  "jax>=0.4.30",
+  "jaxlib>=0.4.30",
+  "numpyro>=0.15.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourname/numpyro-inferutils"
+Source = "https://github.com/yourname/numpyro-inferutils"
+Issues = "https://github.com/yourname/numpyro-inferutils/issues"
+
+[tool.hatch.build]
+# include only the src/ tree
+packages = ["src/numpyro_inferutils"]
