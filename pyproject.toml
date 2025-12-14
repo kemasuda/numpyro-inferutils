@@ -24,9 +24,11 @@ Homepage = "https://github.com/yourname/numpyro-inferutils"
 Source = "https://github.com/yourname/numpyro-inferutils"
 Issues = "https://github.com/yourname/numpyro-inferutils/issues"
 
-[tool.hatch.build]
-# include only the src/ tree
+[tool.hatch.build.targets.wheel]
 packages = ["src/numpyro_inferutils"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/numpyro_inferutils/**"]
 
 [project.optional-dependencies]
 test = ["pytest"]
