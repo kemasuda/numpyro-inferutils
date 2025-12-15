@@ -7,6 +7,7 @@ This package provides lightweight helpers for:
 - working with constrained / unconstrained parameter spaces,
 - computing Fisher information matrices from NumPyro models with
   independent Gaussian likelihoods.
+- performing MAP estimation using stochastic variational inference (SVI).
 
 ---
 
@@ -81,12 +82,38 @@ params_unconstrained = to_unconstrained_dict(
 )
 ```
 
-This inspects the model’s sample-site supports and applies the appropriate
-inverse transforms using
+This inspects the model’s sample-site supports and applies the appropriate inverse transforms using
 
 ```python
 biject_to(site["fn"].support)
 ```
+
+---
+
+### MAP estimation via SVI
+
+For many applications, it is useful to obtain a fast maximum a posteriori (MAP) estimate, for example as an initial point for NUTS.
+
+```python
+import jax
+from numpyro_inferutils import find_map_svi
+
+rng_key = jax.random.PRNGKey(0)
+
+p_map = find_map_svi(
+    model,
+    step_size=1e-2,
+    num_steps=5_000,
+    rng_key=rng_key,
+    x=x,
+    y=y,
+)
+```
+
+- The MAP estimate is obtained via stochastic variational inference (SVI) using a Laplace autoguide (`AutoLaplaceApproximation`).
+- Only a MAP-like point estimate (the guide median) is returned; the covariance of the Laplace approximation is intentionally not used.
+- Parameter constraints defined in the NumPyro model are handled automatically.
+- The returned parameters are in the constrained space.
 
 ---
 
