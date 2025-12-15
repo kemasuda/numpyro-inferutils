@@ -108,9 +108,9 @@ info = information_from_model_independent_normal(
 F = info["fisher"]
 ```
 
-The Fisher matrix is approximated as
+The Fisher matrix for an independent Gaussian likelihood is computed as
 
-F ≈ Jᵀ J,
+F = Jᵀ J,
 
 where J_ij = ∂r_i / ∂θ_j and
 
