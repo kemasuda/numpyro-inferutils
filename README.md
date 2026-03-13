@@ -145,6 +145,22 @@ r = (y − μ(θ)) / σ.
 
 Both constrained and unconstrained parameterizations are supported.
 
+When the model mean is split across multiple deterministic sites, `mu_name` may also be given as a list or tuple. In that case, the corresponding mean vectors are flattened and concatenated before constructing the standardized residuals. The same convention is supported for `observed`, `obs_name`, and `sigma_sd`: each may be passed either as one already-concatenated 1D array, or as a list/tuple matching the blocks in `mu_name`.
+
+```python
+info = information_from_model_independent_normal(
+    model=model,
+    pdic={"w": 1.0, "b": 0.5},
+    mu_name=["mu_flux", "mu_rv"],
+    observed=[y_flux, y_rv],
+    sigma_sd=[sigma_flux, sigma_rv],
+    model_args=(x_flux, x_rv, y_flux, y_rv),
+    keys=["w", "b"],
+)
+```
+
+The final concatenated shapes of `mu`, `observed`, and `sigma_sd` must agree.
+
 ---
 
 ## License
