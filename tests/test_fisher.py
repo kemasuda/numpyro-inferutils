@@ -1,6 +1,7 @@
 # tests/test_fisher.py
 
 import jax.numpy as jnp
+import pytest
 from jax import random, jacrev
 import numpyro
 import numpyro.distributions as dist
@@ -66,6 +67,26 @@ def positive_param_model(x, sigma):
     mu = alpha * x
     numpyro.deterministic("mu", mu)
     numpyro.sample("obs", dist.Normal(mu, sigma), obs=None)
+
+
+def two_block_linear_gaussian_model(x1, x2, sigma1, sigma2, y1=None, y2=None):
+    """Two independent Gaussian blocks sharing the same linear mean parameters."""
+    w = numpyro.sample("w", dist.Normal(0.0, 1.0))
+    b = numpyro.sample("b", dist.Normal(0.0, 1.0))
+
+    mu1 = w * x1 + b
+    mu2 = w * x2 + b
+
+    numpyro.deterministic("mu1", mu1)
+    numpyro.deterministic("mu2", mu2)
+
+    numpyro.sample("obs1", dist.Normal(mu1, sigma1), obs=y1)
+    numpyro.sample("obs2", dist.Normal(mu2, sigma2), obs=y2)
+
+
+def analytic_fisher_two_block_linear(x1, sigma1, x2, sigma2):
+    """Analytic Fisher for two independent linear-Gaussian blocks."""
+    return analytic_fisher_linear(x1, sigma1) + analytic_fisher_linear(x2, sigma2)
 
 
 # ---------------------------------------------------------------------------
@@ -238,3 +259,104 @@ def test_information_unconstrained_positive_param_matches_manual_chainrule():
 
     assert F_ref.shape == (1, 1)
     assert jnp.allclose(F_unconstrained, F_ref, rtol=1e-5, atol=1e-7)
+
+
+def test_information_from_model_independent_normal_multiple_mu_block_inputs():
+    """Multiple deterministic sites can be concatenated blockwise."""
+    key = random.PRNGKey(2)
+
+    x1 = jnp.array([-1.0, 0.5, 1.5])
+    x2 = jnp.array([0.2, 1.2])
+    sigma1 = 0.3
+    sigma2 = 0.7
+
+    w0 = 0.8
+    b0 = -0.4
+    y1 = w0 * x1 + b0
+    y2 = w0 * x2 + b0
+
+    info = information_from_model_independent_normal(
+        model=two_block_linear_gaussian_model,
+        model_args=(x1, x2, sigma1, sigma2),
+        model_kwargs={"y1": y1, "y2": y2},
+        pdic={"w": jnp.array(w0), "b": jnp.array(b0)},
+        mu_name=["mu1", "mu2"],
+        observed=[y1, y2],
+        obs_name=["obs1", "obs2"],
+        keys=["w", "b"],
+        sigma_sd=[jnp.full_like(x1, sigma1), jnp.full_like(x2, sigma2)],
+        param_space="unconstrained",
+        rng_key=key,
+        diff_mode="rev",
+    )
+
+    F = info["fisher"]
+    F_expected = analytic_fisher_two_block_linear(x1, sigma1, x2, sigma2)
+
+    assert F.shape == (2, 2)
+    assert jnp.allclose(F, F_expected, rtol=1e-4, atol=1e-6)
+
+
+def test_information_from_model_independent_normal_multiple_mu_obs_from_trace():
+    """Multiple observed sites can also be read from the model trace."""
+    key = random.PRNGKey(3)
+
+    x1 = jnp.array([-0.5, 0.0, 1.0])
+    x2 = jnp.array([0.3, 1.7])
+    sigma1 = 0.4
+    sigma2 = 0.6
+
+    w0 = 1.1
+    b0 = 0.2
+    y1 = w0 * x1 + b0
+    y2 = w0 * x2 + b0
+
+    info = information_from_model_independent_normal(
+        model=two_block_linear_gaussian_model,
+        model_args=(x1, x2, sigma1, sigma2),
+        model_kwargs={"y1": y1, "y2": y2},
+        pdic={"w": jnp.array(w0), "b": jnp.array(b0)},
+        mu_name=["mu1", "mu2"],
+        obs_name=["obs1", "obs2"],
+        keys=["w", "b"],
+        sigma_sd=jnp.concatenate([jnp.full_like(x1, sigma1), jnp.full_like(x2, sigma2)]),
+        param_space="unconstrained",
+        rng_key=key,
+        diff_mode="rev",
+    )
+
+    F = info["fisher"]
+    F_expected = analytic_fisher_two_block_linear(x1, sigma1, x2, sigma2)
+
+    assert F.shape == (2, 2)
+    assert jnp.allclose(F, F_expected, rtol=1e-4, atol=1e-6)
+
+
+def test_information_from_model_independent_normal_multiple_mu_shape_mismatch():
+    """Blockwise sigma must match the corresponding deterministic block sizes."""
+    key = random.PRNGKey(4)
+
+    x1 = jnp.array([0.0, 1.0, 2.0])
+    x2 = jnp.array([0.5, 1.5])
+    sigma1 = 0.3
+    sigma2 = 0.5
+
+    w0 = 0.5
+    b0 = 0.1
+    y1 = w0 * x1 + b0
+    y2 = w0 * x2 + b0
+
+    with pytest.raises(ValueError, match=r"sigma_sd\[1\]"):
+        information_from_model_independent_normal(
+            model=two_block_linear_gaussian_model,
+            model_args=(x1, x2, sigma1, sigma2),
+            model_kwargs={"y1": y1, "y2": y2},
+            pdic={"w": jnp.array(w0), "b": jnp.array(b0)},
+            mu_name=["mu1", "mu2"],
+            observed=[y1, y2],
+            keys=["w", "b"],
+            sigma_sd=[jnp.full_like(x1, sigma1), jnp.ones(3)],
+            param_space="unconstrained",
+            rng_key=key,
+            diff_mode="rev",
+        )
