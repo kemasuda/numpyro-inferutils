@@ -5,6 +5,41 @@ from numpyro import handlers
 from .transforms import _to_unconstrained, _seed_and_substitute
 
 
+def _as_list(x):
+    return list(x) if isinstance(x, (list, tuple)) else [x]
+
+
+def _concat_blocks(blocks):
+    return blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks)
+
+
+def _prepare_vector(
+    x,
+    *,
+    block_lengths=None,
+    name="value",
+    allow_scalar_broadcast=False,
+):
+    """Normalize an input into a 1D vector."""
+    if isinstance(x, (list, tuple)) and block_lengths is not None and len(x) == len(block_lengths):
+        parts = []
+        for i, (xi, n) in enumerate(zip(x, block_lengths)):
+            ai = jnp.asarray(xi).reshape(-1)
+            if allow_scalar_broadcast and ai.size == 1:
+                ai = jnp.broadcast_to(ai, (n,))
+            if ai.shape != (n,):
+                raise ValueError(
+                    f"{name}[{i}] has shape {ai.shape}, expected {(n,)}."
+                )
+            parts.append(ai)
+        return _concat_blocks(parts)
+
+    a = jnp.asarray(x).reshape(-1)
+    if block_lengths is not None and allow_scalar_broadcast and a.size == 1:
+        a = jnp.broadcast_to(a, (sum(block_lengths),))
+    return a
+
+
 def _std_residuals_from_model_independent_normal(
     model,
     params_dict,
@@ -28,11 +63,17 @@ def _std_residuals_from_model_independent_normal(
             constrained or unconstrained space.
         param_space (str): Either "constrained" or "unconstrained".
         rng_key (jax.random.PRNGKey): RNG key used to seed the model.
-        sigma_sd (array-like): Standard deviations for each data point.
-        mu_name (str, optional): Deterministic site name holding the model mean.
-        obs_name (str, optional): Observed site name for the data.
-        observed (array-like, optional): Explicit observed values; overrides
-            trace values if provided.
+        sigma_sd (array-like or list/tuple of array-like):
+            Standard deviations for each data point. If `mu_name` is multiple,
+            this may be one concatenated array or one entry per block.
+        mu_name (str or list/tuple of str, optional): Deterministic site
+            name(s) holding the model mean. If multiple names are given, they
+            are flattened and concatenated.
+        obs_name (str or list/tuple of str, optional): Observed site name(s)
+            for the data. If multiple names are given, they are flattened and
+            concatenated.
+        observed (array-like or list/tuple of array-like, optional): Explicit
+            observed values; overrides trace values if provided.
         model_args (tuple): Positional arguments for the model.
         model_kwargs (dict or None): Keyword arguments for the model.
 
@@ -48,21 +89,59 @@ def _std_residuals_from_model_independent_normal(
     seeded = _seed_and_substitute(model, params_dict, param_space, rng_key)
     trace = handlers.trace(seeded).get_trace(*model_args, **model_kwargs)
 
-    if mu_name not in trace:
-        raise KeyError(
-            f"deterministic mu '{mu_name}' not found in trace. "
-            "Record it via numpyro.deterministic(mu_name, mu)."
-        )
-    mu = jnp.asarray(trace[mu_name]["value"]).reshape(-1)
-    sigma_sd = jnp.asarray(sigma_sd).reshape(-1)
+    mu_names = _as_list(mu_name)
+    mu_blocks = []
+    for name in mu_names:
+        if name not in trace:
+            raise KeyError(
+                f"deterministic mu '{name}' not found in trace. "
+                "Record it via numpyro.deterministic(mu_name, mu)."
+            )
+        mu_blocks.append(jnp.asarray(trace[name]["value"]).reshape(-1))
+
+    block_lengths = [b.shape[0] for b in mu_blocks]
+    mu = _concat_blocks(mu_blocks)
+
+    sigma_sd = _prepare_vector(
+        sigma_sd,
+        block_lengths=block_lengths,
+        name="sigma_sd",
+        allow_scalar_broadcast=True,
+    )
 
     if observed is not None:
-        y = jnp.asarray(observed).reshape(-1)
+        y = _prepare_vector(
+            observed,
+            block_lengths=block_lengths,
+            name="observed",
+            allow_scalar_broadcast=False,
+        )
     else:
-        if (obs_name not in trace):
-            raise KeyError(f"obs site '{obs_name}' not found in trace.")
+        if obs_name is None:
+            raise ValueError("Either `observed` or `obs_name` must be provided.")
+        obs_names = _as_list(obs_name)
+        if len(obs_names) == 1:
+            name = obs_names[0]
+            if name not in trace:
+                raise KeyError(f"obs site '{name}' not found in trace.")
+            y = jnp.asarray(trace[name]["value"]).reshape(-1)
         else:
-            y = jnp.asarray(trace[obs_name]["value"]).reshape(-1)
+            if len(obs_names) != len(block_lengths):
+                raise ValueError(
+                    "`obs_name` must be a string, or a list/tuple with one "
+                    "entry per `mu_name` block."
+                )
+            obs_blocks = []
+            for i, (name, n) in enumerate(zip(obs_names, block_lengths)):
+                if name not in trace:
+                    raise KeyError(f"obs site '{name}' not found in trace.")
+                yb = jnp.asarray(trace[name]["value"]).reshape(-1)
+                if yb.shape != (n,):
+                    raise ValueError(
+                        f"obs block {i} has shape {yb.shape}, expected {(n,)}."
+                    )
+                obs_blocks.append(yb)
+            y = _concat_blocks(obs_blocks)
 
     if y.shape != mu.shape or y.shape != sigma_sd.shape:
         raise ValueError(
@@ -94,11 +173,13 @@ def information_from_model_independent_normal(
         model: NumPyro model.
         model_args, model_kwargs: static args/kwargs for the model.
         pdic: dict of parameter values in constrained space.
-        mu_name: deterministic site name for the model mean.
-        observed: 1D array of observed values; obs_name is used if not provided.
-        obs_name: observed site name.
+        mu_name: deterministic site name(s) for the model mean. Multiple
+            names are flattened and concatenated.
+        observed: 1D array or blockwise list/tuple of observed values;
+            `obs_name` is used if not provided.
+        obs_name: observed site name(s).
         keys: list of parameter names to differentiate (order preserved).
-        sigma_sd: 1D array of standard deviations (SD) for iid noise.
+        sigma_sd: 1D array or blockwise list/tuple of standard deviations.
         param_space: 'constrained' or 'unconstrained'; use 'unconstrained' to initialize inverse_mass_matrix.
         rng_key: PRNG key (default = jax.random.PRNGKey(0)).
         diff_mode: {'rev', 'fwd'} 
@@ -133,8 +214,11 @@ def information_from_model_independent_normal(
     pdic_sub = OrderedDict((k, _pdic[k]) for k in keys)
     rng_key = random.PRNGKey(0) if rng_key is None else rng_key
     model_kwargs = {} if model_kwargs is None else model_kwargs
+    exclude_names = set(_as_list(mu_name))
+    if obs_name is not None:
+        exclude_names.update(_as_list(obs_name))
     base = dict({k: v for k, v in _pdic.items()
-                if k not in (mu_name, obs_name)})
+                if k not in exclude_names})
 
     def r_fn(p_sub):
         p_all = dict(base)
