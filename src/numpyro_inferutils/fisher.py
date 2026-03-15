@@ -49,7 +49,6 @@ def _trace_model(model, params_dict, param_space, rng_key, *, model_args=(), mod
     return handlers.trace(seeded).get_trace(*model_args, **model_kwargs)
 
 
-
 def _latent_sample_names(model, *, model_args=(), model_kwargs=None):
     """Return non-observed sample-site names in the model trace."""
     model_kwargs = {} if model_kwargs is None else model_kwargs
@@ -61,7 +60,6 @@ def _latent_sample_names(model, *, model_args=(), model_kwargs=None):
         for name, site in tr.items()
         if site["type"] == "sample" and not site["is_observed"]
     ]
-
 
 
 def _prepare_param_dicts(model, pdic, keys, *, param_space, model_args=(), model_kwargs=None):
@@ -77,7 +75,8 @@ def _prepare_param_dicts(model, pdic, keys, *, param_space, model_args=(), model
 
     if param_space == "unconstrained":
         latent_names = set(
-            _latent_sample_names(model, model_args=model_args, model_kwargs=model_kwargs)
+            _latent_sample_names(
+                model, model_args=model_args, model_kwargs=model_kwargs)
         )
         convert_keys = [k for k in pdic.keys() if k in latent_names]
         converted = _to_unconstrained(
@@ -88,15 +87,16 @@ def _prepare_param_dicts(model, pdic, keys, *, param_space, model_args=(), model
     elif param_space == "constrained":
         pdic_all = dict(pdic)
     else:
-        raise ValueError("param_space must be 'constrained' or 'unconstrained'.")
+        raise ValueError(
+            "param_space must be 'constrained' or 'unconstrained'.")
 
     try:
         pdic_sub = OrderedDict((k, pdic_all[k]) for k in keys)
     except KeyError as e:
-        raise KeyError(f"Parameter '{e.args[0]}' in `keys` is missing from `pdic`.") from e
+        raise KeyError(
+            f"Parameter '{e.args[0]}' in `keys` is missing from `pdic`.") from e
 
     return pdic_all, pdic_sub
-
 
 
 def _flatten_jacobian_tree(Jtree, keys):
@@ -112,7 +112,6 @@ def _flatten_jacobian_tree(Jtree, keys):
         c0 += d
     J = jnp.hstack(cols)
     return J, slices, names
-
 
 
 def _flatten_hessian_tree(Htree, pdic_sub, keys):
@@ -140,7 +139,6 @@ def _flatten_hessian_tree(Htree, pdic_sub, keys):
     return H, slices, names
 
 
-
 def _sum_logprob(trace, *, observed):
     """Sum log-probabilities over observed or unobserved sample sites."""
     total = 0.0
@@ -148,7 +146,6 @@ def _sum_logprob(trace, *, observed):
         if site["type"] == "sample" and site["is_observed"] == observed:
             total = total + site["fn"].log_prob(site["value"]).sum()
     return total
-
 
 
 def _objective_from_model(
@@ -184,7 +181,6 @@ def _objective_from_model(
         return _sum_logprob(tr, observed=False) + _sum_logprob(tr, observed=True)
 
     raise ValueError("which must be 'loglik', 'logprior', or 'logprob'.")
-
 
 
 def _std_residuals_from_model_independent_normal(
@@ -269,7 +265,8 @@ def _std_residuals_from_model_independent_normal(
         )
     else:
         if obs_name is None:
-            raise ValueError("Either `observed` or `obs_name` must be provided.")
+            raise ValueError(
+                "Either `observed` or `obs_name` must be provided.")
         obs_names = _as_list(obs_name)
         if len(obs_names) == 1:
             name = obs_names[0]
@@ -301,7 +298,6 @@ def _std_residuals_from_model_independent_normal(
     return (y - mu) / sigma_sd  # (N,)
 
 
-
 def information_from_model_independent_normal(
     *,
     model=None,
@@ -315,7 +311,7 @@ def information_from_model_independent_normal(
     sigma_sd=None,
     param_space="unconstrained",
     rng_key=None,
-    diff_mode="rev",  # "rev" (= jacrev), "fwd" (= jacfwd)
+    diff_mode="fwd",  # usually preferable when N_data >> N_params
 ):
     """
     Compute Fisher information matrix for an independent Gaussian likelihood
@@ -335,11 +331,13 @@ def information_from_model_independent_normal(
         param_space: 'constrained' or 'unconstrained'; use 'unconstrained' to
             initialize inverse_mass_matrix.
         rng_key: PRNG key (default = jax.random.PRNGKey(0)).
-        diff_mode: {'rev', 'fwd'}
-            Differentiation mode for computing the Jacobian.
-            Currently jnkepler does not work with 'fwd', but it is provided for
-            custom models where forward-mode is compatible. This can be faster
-            when N >> P.
+        diff_mode: {'fwd', 'rev'}
+            Differentiation mode for computing the Jacobian of the
+            standardized residuals with respect to the parameters.
+            The default is `'fwd'`, which is often preferable when the
+            number of data points is much larger than the number of
+            differentiated parameters. Use `'rev'` if forward-mode
+            autodiff is unsupported or slower for the model of interest.
 
     Returns:
         dict:
@@ -406,7 +404,6 @@ def information_from_model_independent_normal(
         "col_names": names,
         "params_unconstrained": pdic_all,
     }
-
 
 
 def hessian_from_model(
