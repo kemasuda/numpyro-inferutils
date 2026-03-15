@@ -5,8 +5,8 @@ Small utility functions for inference with NumPyro models.
 This package provides lightweight helpers for:
 - extracting log-prior and log-likelihood from NumPyro models,
 - working with constrained / unconstrained parameter spaces,
-- computing Fisher information matrices from NumPyro models with
-  independent Gaussian likelihoods.
+- computing Fisher information matrices from NumPyro models with independent Gaussian likelihoods,
+- computing Hessian matrices of log-likelihood / log-prior / log-posterior directly from NumPyro models,
 - performing MAP estimation using stochastic variational inference (SVI).
 
 ---
@@ -38,10 +38,8 @@ def model(x, y):
     w = numpyro.sample("w", dist.Normal(0.0, 1.0))
     b = numpyro.sample("b", dist.Normal(0.0, 1.0))
     sigma = numpyro.sample("sigma", dist.LogNormal(0.0, 0.01))
-
     mu = w * x + b
     numpyro.deterministic("mu", mu)
-
     numpyro.sample("obs", dist.Normal(mu, sigma), obs=y)
 ```
 
@@ -63,8 +61,7 @@ ll = loglik(theta)
 
 - `logprior(theta)` sums log-probabilities from *non-observed* sample sites.
 - `loglik(theta)` sums log-probabilities from *observed* sample sites.
-- Contributions added via `numpyro.factor` are treated as part of the
-  log-likelihood.
+- Contributions added via `numpyro.factor` are treated as part of the log-likelihood.
 
 ---
 
@@ -75,10 +72,7 @@ from numpyro_inferutils.transforms import to_unconstrained_dict
 
 params_constrained = {"sigma": 2.0}
 params_unconstrained = to_unconstrained_dict(
-    model,
-    params_constrained,
-    keys=["sigma"],
-    x=x, y=y
+    model, params_constrained, keys=["sigma"], x=x, y=y
 )
 ```
 
@@ -136,16 +130,14 @@ F = info["fisher"]
 ```
 
 The Fisher matrix for an independent Gaussian likelihood is computed as
-
-F = Jᵀ J,
-
-where J_ij = ∂r_i / ∂θ_j and
-
-r = (y − μ(θ)) / σ.
+F = Jᵀ J, where J_ij = ∂r_i / ∂θ_j and r = (y − μ(θ)) / σ.
 
 Both constrained and unconstrained parameterizations are supported.
+When the model mean is split across multiple deterministic sites, `mu_name` may also be given as a list or tuple.
+In that case, the corresponding mean vectors are flattened and concatenated before constructing the standardized residuals.
 
-When the model mean is split across multiple deterministic sites, `mu_name` may also be given as a list or tuple. In that case, the corresponding mean vectors are flattened and concatenated before constructing the standardized residuals. The same convention is supported for `observed`, `obs_name`, and `sigma_sd`: each may be passed either as one already-concatenated 1D array, or as a list/tuple matching the blocks in `mu_name`.
+The same convention is supported for `observed`, `obs_name`, and `sigma_sd`:
+each may be passed either as one already-concatenated 1D array, or as a list/tuple matching the blocks in `mu_name`.
 
 ```python
 info = information_from_model_independent_normal(
@@ -157,9 +149,49 @@ info = information_from_model_independent_normal(
     model_args=(x_flux, x_rv, y_flux, y_rv),
     keys=["w", "b"],
 )
+
+F = info["fisher"]
 ```
 
 The final concatenated shapes of `mu`, `observed`, and `sigma_sd` must agree.
+
+---
+
+### Hessian from a NumPyro model
+
+```python
+from numpyro_inferutils.fisher import hessian_from_model
+
+res = hessian_from_model(
+    model=model,
+    model_args=(x, y),
+    pdic={"w": 1.0, "b": 0.5},
+    keys=["w", "b"],
+    which="logprob",              # or "loglik", "logprior"
+    param_space="unconstrained",  # or "constrained"
+)
+
+H = res["hessian"]
+```
+
+This function computes the Hessian of a scalar objective constructed directly from a NumPyro model.
+
+- `which="loglik"` returns the Hessian of the log-likelihood.
+- `which="logprior"` returns the Hessian of the log-prior.
+- `which="logprob"` returns the Hessian of the full log-posterior up to an additive constant.
+
+The returned matrix follows the parameter order specified by `keys`.
+As in the Fisher helper, array-valued parameters are flattened and concatenated in a stable order, and the result dictionary includes `col_names` and `col_slices`.
+
+```python
+H = res["hessian"]
+col_names = res["col_names"]
+```
+
+If you need the curvature of the negative log-posterior or the observed information matrix, use `-H`.
+
+For an independent Gaussian likelihood with fixed standard deviations and a model mean that is linear in the parameters, -H` for `which="loglik" agrees with the Fisher matrix returned by
+`information_from_model_independent_normal(...)`.
 
 ---
 

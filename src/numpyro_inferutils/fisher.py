@@ -1,8 +1,10 @@
 from collections import OrderedDict
+
 import jax.numpy as jnp
-from jax import jacrev, jacfwd, random
+from jax import jacfwd, jacrev, random
 from numpyro import handlers
-from .transforms import _to_unconstrained, _seed_and_substitute
+
+from .transforms import _seed_and_substitute, _to_unconstrained
 
 
 def _as_list(x):
@@ -40,6 +42,147 @@ def _prepare_vector(
     return a
 
 
+def _trace_model(model, params_dict, param_space, rng_key, *, model_args=(), model_kwargs=None):
+    """Run a NumPyro model with substituted parameters and return the trace."""
+    model_kwargs = {} if model_kwargs is None else model_kwargs
+    seeded = _seed_and_substitute(model, params_dict, param_space, rng_key)
+    return handlers.trace(seeded).get_trace(*model_args, **model_kwargs)
+
+
+def _latent_sample_names(model, *, model_args=(), model_kwargs=None):
+    """Return non-observed sample-site names in the model trace."""
+    model_kwargs = {} if model_kwargs is None else model_kwargs
+    tr = handlers.trace(handlers.seed(model, random.PRNGKey(0))).get_trace(
+        *model_args, **model_kwargs
+    )
+    return [
+        name
+        for name, site in tr.items()
+        if site["type"] == "sample" and not site["is_observed"]
+    ]
+
+
+def _prepare_param_dicts(model, pdic, keys, *, param_space, model_args=(), model_kwargs=None):
+    """
+    Prepare full and differentiable parameter dicts in the requested parameter space.
+
+    `pdic` is assumed to contain constrained values. When `param_space='unconstrained'`,
+    any latent sample sites present in `pdic` are mapped to unconstrained space.
+    Non-latent entries are kept as-is.
+    """
+    model_kwargs = {} if model_kwargs is None else model_kwargs
+    keys = list(keys)
+
+    if param_space == "unconstrained":
+        latent_names = set(
+            _latent_sample_names(
+                model, model_args=model_args, model_kwargs=model_kwargs)
+        )
+        convert_keys = [k for k in pdic.keys() if k in latent_names]
+        converted = _to_unconstrained(
+            model, pdic, convert_keys, *model_args, **model_kwargs
+        ) if len(convert_keys) > 0 else {}
+        pdic_all = dict(pdic)
+        pdic_all.update(converted)
+    elif param_space == "constrained":
+        pdic_all = dict(pdic)
+    else:
+        raise ValueError(
+            "param_space must be 'constrained' or 'unconstrained'.")
+
+    try:
+        pdic_sub = OrderedDict((k, pdic_all[k]) for k in keys)
+    except KeyError as e:
+        raise KeyError(
+            f"Parameter '{e.args[0]}' in `keys` is missing from `pdic`.") from e
+
+    return pdic_all, pdic_sub
+
+
+def _flatten_jacobian_tree(Jtree, keys):
+    """Flatten a Jacobian pytree into a dense matrix with stable column metadata."""
+    N = Jtree[keys[0]].shape[0]
+    cols, names, slices, c0 = [], [], {}, 0
+    for k in keys:
+        Jk = jnp.asarray(Jtree[k]).reshape(N, -1)
+        cols.append(Jk)
+        d = Jk.shape[1]
+        names += [k] if d == 1 else [f"{k}[{i}]" for i in range(d)]
+        slices[k] = slice(c0, c0 + d)
+        c0 += d
+    J = jnp.hstack(cols)
+    return J, slices, names
+
+
+def _flatten_hessian_tree(Htree, pdic_sub, keys):
+    """Flatten a Hessian pytree-of-pytrees into a dense matrix."""
+    sizes = OrderedDict((k, int(jnp.asarray(pdic_sub[k]).size)) for k in keys)
+
+    names, slices, c0 = [], {}, 0
+    for k in keys:
+        d = sizes[k]
+        names += [k] if d == 1 else [f"{k}[{i}]" for i in range(d)]
+        slices[k] = slice(c0, c0 + d)
+        c0 += d
+
+    rows = []
+    for ki in keys:
+        di = sizes[ki]
+        row_blocks = []
+        for kj in keys:
+            dj = sizes[kj]
+            Hij = jnp.asarray(Htree[ki][kj]).reshape(di, dj)
+            row_blocks.append(Hij)
+        rows.append(jnp.hstack(row_blocks))
+
+    H = jnp.vstack(rows)
+    return H, slices, names
+
+
+def _sum_logprob(trace, *, observed):
+    """Sum log-probabilities over observed or unobserved sample sites."""
+    total = 0.0
+    for _, site in trace.items():
+        if site["type"] == "sample" and site["is_observed"] == observed:
+            total = total + site["fn"].log_prob(site["value"]).sum()
+    return total
+
+
+def _objective_from_model(
+    model,
+    params_dict,
+    param_space,
+    rng_key,
+    *,
+    which,
+    model_args=(),
+    model_kwargs=None,
+):
+    """
+    Evaluate logprior / loglik / logprob from a NumPyro model.
+
+    Contributions from `numpyro.factor` are treated as observed-site terms and
+    therefore contribute to `loglik` and `logprob`, not to `logprior`.
+    """
+    tr = _trace_model(
+        model,
+        params_dict,
+        param_space,
+        rng_key,
+        model_args=model_args,
+        model_kwargs=model_kwargs,
+    )
+
+    if which == "logprior":
+        return _sum_logprob(tr, observed=False)
+    if which == "loglik":
+        return _sum_logprob(tr, observed=True)
+    if which == "logprob":
+        return _sum_logprob(tr, observed=False) + _sum_logprob(tr, observed=True)
+
+    raise ValueError("which must be 'loglik', 'logprior', or 'logprob'.")
+
+
 def _std_residuals_from_model_independent_normal(
     model,
     params_dict,
@@ -54,8 +197,8 @@ def _std_residuals_from_model_independent_normal(
     model_kwargs=None,
 ):
     """
-    Build standardized residuals r = (y - mu(theta)) / sigma for an
-    independent Gaussian likelihood, using a NumPyro model.
+    Build standardized residuals r = (y - mu(theta)) / sigma for an independent
+    Gaussian likelihood, using a NumPyro model.
 
     Args:
         model (callable): NumPyro model.
@@ -63,15 +206,14 @@ def _std_residuals_from_model_independent_normal(
             constrained or unconstrained space.
         param_space (str): Either "constrained" or "unconstrained".
         rng_key (jax.random.PRNGKey): RNG key used to seed the model.
-        sigma_sd (array-like or list/tuple of array-like):
-            Standard deviations for each data point. If `mu_name` is multiple,
-            this may be one concatenated array or one entry per block.
-        mu_name (str or list/tuple of str, optional): Deterministic site
-            name(s) holding the model mean. If multiple names are given, they
-            are flattened and concatenated.
-        obs_name (str or list/tuple of str, optional): Observed site name(s)
-            for the data. If multiple names are given, they are flattened and
-            concatenated.
+        sigma_sd (array-like or list/tuple of array-like): Standard deviations for
+            each data point. If `mu_name` is multiple, this may be one concatenated
+            array or one entry per block.
+        mu_name (str or list/tuple of str, optional): Deterministic site name(s)
+            holding the model mean. If multiple names are given, they are flattened
+            and concatenated.
+        obs_name (str or list/tuple of str, optional): Observed site name(s) for
+            the data. If multiple names are given, they are flattened and concatenated.
         observed (array-like or list/tuple of array-like, optional): Explicit
             observed values; overrides trace values if provided.
         model_args (tuple): Positional arguments for the model.
@@ -81,13 +223,18 @@ def _std_residuals_from_model_independent_normal(
         jnp.ndarray: Standardized residuals with shape (N,).
 
     Raises:
-        KeyError: If `mu_name` or `obs_name` is not found in the trace
-            (when required).
+        KeyError: If `mu_name` or `obs_name` is not found in the trace (when required).
         ValueError: If shapes of `y`, `mu`, and `sigma_sd` do not match.
     """
     model_kwargs = {} if model_kwargs is None else model_kwargs
-    seeded = _seed_and_substitute(model, params_dict, param_space, rng_key)
-    trace = handlers.trace(seeded).get_trace(*model_args, **model_kwargs)
+    trace = _trace_model(
+        model,
+        params_dict,
+        param_space,
+        rng_key,
+        model_args=model_args,
+        model_kwargs=model_kwargs,
+    )
 
     mu_names = _as_list(mu_name)
     mu_blocks = []
@@ -118,7 +265,8 @@ def _std_residuals_from_model_independent_normal(
         )
     else:
         if obs_name is None:
-            raise ValueError("Either `observed` or `obs_name` must be provided.")
+            raise ValueError(
+                "Either `observed` or `obs_name` must be provided.")
         obs_names = _as_list(obs_name)
         if len(obs_names) == 1:
             name = obs_names[0]
@@ -145,8 +293,8 @@ def _std_residuals_from_model_independent_normal(
 
     if y.shape != mu.shape or y.shape != sigma_sd.shape:
         raise ValueError(
-            f"shape mismatch: y {y.shape}, mu {mu.shape}, sigma {sigma_sd.shape}")
-
+            f"shape mismatch: y {y.shape}, mu {mu.shape}, sigma {sigma_sd.shape}"
+        )
     return (y - mu) / sigma_sd  # (N,)
 
 
@@ -163,62 +311,66 @@ def information_from_model_independent_normal(
     sigma_sd=None,
     param_space="unconstrained",
     rng_key=None,
-    diff_mode="rev",  # "rev" (= jacrev), "fwd" (= jacfwd)
+    diff_mode="fwd",  # usually preferable when N_data >> N_params
 ):
     """
-    Compute Fisher information matrix for independent Gaussian likelihood directly from a NumPyro model,
-    using (observed - mu(pdic)) / sigma_sd obtained from a NumPyro model. 
+    Compute Fisher information matrix for an independent Gaussian likelihood
+    directly from a NumPyro model, using (observed - mu(pdic)) / sigma_sd.
 
     Args:
         model: NumPyro model.
         model_args, model_kwargs: static args/kwargs for the model.
         pdic: dict of parameter values in constrained space.
-        mu_name: deterministic site name(s) for the model mean. Multiple
-            names are flattened and concatenated.
-        observed: 1D array or blockwise list/tuple of observed values;
-            `obs_name` is used if not provided.
+        mu_name: deterministic site name(s) for the model mean. Multiple names
+            are flattened and concatenated.
+        observed: 1D array or blockwise list/tuple of observed values; `obs_name`
+            is used if not provided.
         obs_name: observed site name(s).
         keys: list of parameter names to differentiate (order preserved).
         sigma_sd: 1D array or blockwise list/tuple of standard deviations.
-        param_space: 'constrained' or 'unconstrained'; use 'unconstrained' to initialize inverse_mass_matrix.
+        param_space: 'constrained' or 'unconstrained'; use 'unconstrained' to
+            initialize inverse_mass_matrix.
         rng_key: PRNG key (default = jax.random.PRNGKey(0)).
-        diff_mode: {'rev', 'fwd'} 
-            Differentiation mode for computing the Jacobian.
-            Currently jnkepler doens't work with 'fwd', but it is provided for
-            custom models where forward-mode is compatible. This can be faster when N >> P.
+        diff_mode: {'fwd', 'rev'}
+            Differentiation mode for computing the Jacobian of the
+            standardized residuals with respect to the parameters.
+            The default is `'fwd'`, which is often preferable when the
+            number of data points is much larger than the number of
+            differentiated parameters. Use `'rev'` if forward-mode
+            autodiff is unsupported or slower for the model of interest.
 
     Returns:
-        dict: A dictionary containing the Fisher information results and related metadata:
-
+        dict:
             - "fisher" (jnp.ndarray): The (P, P) Fisher information matrix.
-            - "col_slices" (dict[str, slice]): Mapping from each parameter name to its
-              corresponding column range in the Fisher matrix.
-            - "col_names" (list[str]): Flattened per-column names, matching the order of
-              columns in the Fisher matrix.
-            - "params_unconstrained" (dict[str, jnp.ndarray]): Parameter values in the
-              unconstrained space used for differentiation.
+            - "col_slices" (dict[str, slice]): Mapping from each parameter name
+              to its corresponding column range in the Fisher matrix.
+            - "col_names" (list[str]): Flattened per-column names.
+            - "params_unconstrained" (dict[str, jnp.ndarray]): Parameter values
+              in the requested differentiation space used internally.
     """
-    assert model is not None and pdic is not None and mu_name is not None and keys is not None and sigma_sd is not None
+    assert (
+        model is not None
+        and pdic is not None
+        and mu_name is not None
+        and keys is not None
+        and sigma_sd is not None
+    )
     if (observed is None) and (obs_name is None):
         raise ValueError("Either `observed` or `obs_name` must be provided.")
-    keys = list(keys)
 
-    if param_space == "unconstrained":
-        _pdic = _to_unconstrained(
-            model, pdic, keys, *model_args, **(model_kwargs or {}))
-    elif param_space == "constrained":
-        _pdic = dict({k: pdic[k] for k in keys})
-    else:
-        raise ValueError(
-            "param_space must be 'constrained' or 'unconstrained'.")
-    pdic_sub = OrderedDict((k, _pdic[k]) for k in keys)
+    keys = list(keys)
     rng_key = random.PRNGKey(0) if rng_key is None else rng_key
     model_kwargs = {} if model_kwargs is None else model_kwargs
-    exclude_names = set(_as_list(mu_name))
-    if obs_name is not None:
-        exclude_names.update(_as_list(obs_name))
-    base = dict({k: v for k, v in _pdic.items()
-                if k not in exclude_names})
+
+    pdic_all, pdic_sub = _prepare_param_dicts(
+        model,
+        pdic,
+        keys,
+        param_space=param_space,
+        model_args=model_args,
+        model_kwargs=model_kwargs,
+    )
+    base = dict((k, v) for k, v in pdic_all.items() if k not in keys)
 
     def r_fn(p_sub):
         p_all = dict(base)
@@ -233,10 +385,9 @@ def information_from_model_independent_normal(
             obs_name=obs_name,
             model_args=model_args,
             model_kwargs=model_kwargs,
-            observed=observed
-        )  # (N,)
+            observed=observed,
+        )
 
-    # choose differentiation mode
     if diff_mode == "rev":
         jac = jacrev
     elif diff_mode == "fwd":
@@ -244,25 +395,107 @@ def information_from_model_independent_normal(
     else:
         raise ValueError("diff_mode must be 'rev' or 'fwd'.")
 
-    # Jacobian of standardized residuals w.r.t. params (ordered by `keys`)
     Jtree = jac(r_fn)(pdic_sub)
-
-    # Stack columns in stable key order; flatten trailing dims per key
-    N = Jtree[keys[0]].shape[0]
-    cols, names, slices, c0 = [], [], {}, 0
-    for k in keys:
-        Jk = jnp.asarray(Jtree[k]).reshape(N, -1)
-        cols.append(Jk)
-        d = Jk.shape[1]
-        names += [k] if d == 1 else [f"{k}[{i}]" for i in range(d)]
-        slices[k] = slice(c0, c0 + d)
-        c0 += d
-    J = jnp.hstack(cols)   # (N, P)
-
+    J, slices, names = _flatten_jacobian_tree(Jtree, keys)
     F = J.T @ J
     return {
         "fisher": F,
         "col_slices": slices,
         "col_names": names,
-        "params_unconstrained": _pdic
+        "params_unconstrained": pdic_all,
+    }
+
+
+def hessian_from_model(
+    *,
+    model=None,
+    model_args=(),
+    model_kwargs=None,
+    pdic=None,
+    keys=None,
+    which="logprob",  # "loglik", "logprior", "logprob"
+    param_space="unconstrained",
+    rng_key=None,
+    diff_mode="fwdrev",  # "fwdrev", "revfwd", "revrev", "fwdfwd"
+    symmetrize=True,
+):
+    """
+    Compute the Hessian of loglik / logprior / logprob directly from a NumPyro model.
+
+    Args:
+        model: NumPyro model.
+        model_args, model_kwargs: static args/kwargs for the model.
+        pdic: dict of parameter values in constrained space.
+        keys: list of parameter names to differentiate (order preserved).
+        which: {'loglik', 'logprior', 'logprob'}
+            Target scalar objective whose Hessian is computed.
+        param_space: 'constrained' or 'unconstrained'.
+            Use 'unconstrained' if you want curvature in the unconstrained space.
+        rng_key: PRNG key (default = jax.random.PRNGKey(0)).
+        diff_mode: {'fwdrev', 'revfwd', 'revrev', 'fwdfwd'}
+            Nesting of AD modes for the Hessian. 'fwdrev' is usually a good default.
+        symmetrize: if True, return 0.5 * (H + H.T).
+
+    Returns:
+        dict:
+            - "hessian" (jnp.ndarray): The (P, P) Hessian matrix.
+            - "value" (float): Objective value at the supplied parameter point.
+            - "col_slices" (dict[str, slice]): Mapping from each parameter name
+              to its corresponding column range.
+            - "col_names" (list[str]): Flattened per-column names.
+            - "params_unconstrained" (dict[str, jnp.ndarray]): Parameter values
+              in the requested differentiation space used internally.
+    """
+    assert model is not None and pdic is not None and keys is not None
+
+    keys = list(keys)
+    rng_key = random.PRNGKey(0) if rng_key is None else rng_key
+    model_kwargs = {} if model_kwargs is None else model_kwargs
+
+    pdic_all, pdic_sub = _prepare_param_dicts(
+        model,
+        pdic,
+        keys,
+        param_space=param_space,
+        model_args=model_args,
+        model_kwargs=model_kwargs,
+    )
+    base = dict((k, v) for k, v in pdic_all.items() if k not in keys)
+
+    def objective_fn(p_sub):
+        p_all = dict(base)
+        p_all.update(p_sub)
+        return _objective_from_model(
+            model,
+            p_all,
+            param_space,
+            rng_key,
+            which=which,
+            model_args=model_args,
+            model_kwargs=model_kwargs,
+        )
+
+    if diff_mode == "fwdrev":
+        Htree = jacfwd(jacrev(objective_fn))(pdic_sub)
+    elif diff_mode == "revfwd":
+        Htree = jacrev(jacfwd(objective_fn))(pdic_sub)
+    elif diff_mode == "revrev":
+        Htree = jacrev(jacrev(objective_fn))(pdic_sub)
+    elif diff_mode == "fwdfwd":
+        Htree = jacfwd(jacfwd(objective_fn))(pdic_sub)
+    else:
+        raise ValueError(
+            "diff_mode must be 'fwdrev', 'revfwd', 'revrev', or 'fwdfwd'."
+        )
+
+    H, slices, names = _flatten_hessian_tree(Htree, pdic_sub, keys)
+    if symmetrize:
+        H = 0.5 * (H + H.T)
+
+    return {
+        "hessian": H,
+        "value": objective_fn(pdic_sub),
+        "col_slices": slices,
+        "col_names": names,
+        "params_unconstrained": pdic_all,
     }
