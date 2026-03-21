@@ -48,7 +48,7 @@ def model(x, y):
 ```python
 from numpyro_inferutils import build_logprob_functions
 
-logprior, loglik = build_logprob_functions(model, model_kwargs={"x": x, "y": y})
+logprior, loglik = build_logprob_functions(model, model_args=(x, y))
 
 theta = {
     "w": 0.0,
