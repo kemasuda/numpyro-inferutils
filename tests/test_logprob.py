@@ -50,3 +50,30 @@ def test_build_logprob_functions_vector_sum():
 
     assert jnp.allclose(lp, expected_lp)
     assert jnp.allclose(ll, expected_ll)
+
+
+def linear_model(x, y):
+    w = numpyro.sample("w", dist.Normal(0.0, 1.0))
+    mu = w * x
+    numpyro.sample("obs", dist.Normal(mu, 1.0), obs=y)
+
+
+def test_build_logprob_functions_with_model_args():
+    x = jnp.array([1.0, 2.0])
+    y = jnp.array([0.5, 1.0])
+
+    logprior, loglik = build_logprob_functions(
+        linear_model,
+        model_args=(x, y),
+    )
+
+    theta = {"w": jnp.array(0.5)}
+
+    lp = logprior(theta)
+    ll = loglik(theta)
+
+    expected_lp = dist.Normal(0.0, 1.0).log_prob(theta["w"])
+    expected_ll = dist.Normal(theta["w"] * x, 1.0).log_prob(y).sum()
+
+    assert jnp.allclose(lp, expected_lp)
+    assert jnp.allclose(ll, expected_ll)
