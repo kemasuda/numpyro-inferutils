@@ -4,7 +4,9 @@ import numpy as np
 import jax.numpy as jnp
 from jax import random
 from numpyro.handlers import seed, trace
+from numpyro.infer import Predictive
 import numpyro.distributions as dist
+import warnings
 
 from ..logprob import build_logprob_functions
 
@@ -78,6 +80,8 @@ def _uniform_reparam_transform(fn):
       - ``TransformedDistribution``
       - ``Independent`` / ``ExpandedDistribution`` / ``MaskedDistribution``
       - ``MultivariateNormal``
+      - ``Bernoulli`` / ``Categorical``
+      - ``Gamma`` (with dtype stabilization)
 
     Unsupported distributions can be passed via ``site_overrides``.
     """
@@ -107,6 +111,16 @@ def _uniform_reparam_transform(fn):
             "Pass site_overrides={'site_name': custom_transform}."
         )
 
+    if isinstance(fn, dist.Gamma):
+        # NumPyro's Gamma.icdf can fail when concentration/rate are integer typed,
+        # because the underlying TFP helper expects a floating common dtype.
+        dtype = jnp.result_type(fn.concentration, fn.rate, float)
+        gamma = dist.Gamma(
+            jnp.asarray(fn.concentration, dtype=dtype),
+            jnp.asarray(fn.rate, dtype=dtype),
+        )
+        return lambda q: gamma.icdf(_safe_unit_interval(q))
+
     if hasattr(fn, "icdf"):
         return lambda q: fn.icdf(_safe_unit_interval(q))
 
@@ -116,11 +130,14 @@ def _uniform_reparam_transform(fn):
     )
 
 
-def _get_latent_site_info(model, *, model_args=(), model_kwargs=None):
+def _get_trace(model, *, model_args=(), model_kwargs=None):
     model_args = tuple(model_args)
     model_kwargs = {} if model_kwargs is None else dict(model_kwargs)
+    return trace(seed(model, random.PRNGKey(0))).get_trace(*model_args, **model_kwargs)
 
-    tr = trace(seed(model, random.PRNGKey(0))).get_trace(*model_args, **model_kwargs)
+
+def _get_latent_site_info(model, *, model_args=(), model_kwargs=None):
+    tr = _get_trace(model, model_args=model_args, model_kwargs=model_kwargs)
 
     site_info = []
     for name, site in tr.items():
@@ -144,6 +161,11 @@ def _get_latent_site_info(model, *, model_args=(), model_kwargs=None):
     return site_info
 
 
+def _get_deterministic_site_names(model, *, model_args=(), model_kwargs=None):
+    tr = _get_trace(model, model_args=model_args, model_kwargs=model_kwargs)
+    return [name for name, site in tr.items() if site["type"] == "deterministic"]
+
+
 class MultiNestRunner:
     """
     Generic PyMultiNest wrapper for a NumPyro model.
@@ -165,7 +187,8 @@ class MultiNestRunner:
         self.model = model
         self.model_args = tuple(model_args)
         self.model_kwargs = {} if model_kwargs is None else dict(model_kwargs)
-        self.site_overrides = {} if site_overrides is None else dict(site_overrides)
+        self.site_overrides = {} if site_overrides is None else dict(
+            site_overrides)
 
         self.logprior, self.loglik = build_logprob_functions(
             model,
@@ -181,6 +204,11 @@ class MultiNestRunner:
         self.site_names = [s["name"] for s in self.site_info]
         self.param_names = list(self.site_names)
         self.ndim = sum(s["size"] for s in self.site_info)
+        self.deterministic_site_names = _get_deterministic_site_names(
+            model,
+            model_args=self.model_args,
+            model_kwargs=self.model_kwargs,
+        )
 
         self.transforms = {}
         for s in self.site_info:
@@ -209,7 +237,14 @@ class MultiNestRunner:
         for s in self.site_info:
             n = s["size"]
             q = cube[i:i + n].reshape(s["shape"])
-            theta_dict[s["name"]] = self.transforms[s["name"]](q)
+            name = s["name"]
+            try:
+                theta_dict[name] = self.transforms[name](q)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Error in prior transform for site {name!r} "
+                    f"({type(s['fn']).__name__}, shape={s['shape']}): {e}"
+                ) from e
             i += n
         return np.asarray(_flatten_theta_dict(theta_dict, self.site_info), dtype=float)
 
@@ -227,8 +262,8 @@ class MultiNestRunner:
         outputfiles_basename,
         n_live_points=None,
         use_num_live_points_factor=25,
-        const_efficiency_mode=True,
-        sampling_efficiency=0.03,
+        const_efficiency_mode=False,
+        sampling_efficiency=None,
         importance_nested_sampling=False,
         multimodal=True,
         resume=True,
@@ -238,7 +273,14 @@ class MultiNestRunner:
         self.outputfiles_basename = outputfiles_basename
 
         if n_live_points is None:
-            n_live_points = max(use_num_live_points_factor * max(self.ndim, 1), 100)
+            n_live_points = max(
+                use_num_live_points_factor * max(self.ndim, 1), 100)
+
+        if sampling_efficiency is None:
+            sampling_efficiency = 0.03 if const_efficiency_mode else 0.8
+
+        # Dry-run once outside the ctypes callback for clearer Python errors.
+        _ = self.prior(np.full(self.ndim, 0.5, dtype=float))
 
         self.result = solve(
             LogLikelihood=self.loglikelihood,
@@ -271,15 +313,74 @@ class MultiNestRunner:
         arr = np.asarray(analyzer.get_equal_weighted_posterior())[:, :-1]
         return _split_posterior_array(arr, self.site_info)
 
-    def summary(self, *, print_modes=True, make_idata=True):
+    def _normalize_requested_deterministic_sites(self, site_names):
+        if site_names is None:
+            return []
+        if isinstance(site_names, str):
+            site_names = [site_names]
+
+        requested = list(site_names)
+        deterministic_set = set(self.deterministic_site_names)
+        sample_set = set(self.site_names)
+
+        selected = [name for name in requested if name in deterministic_set]
+        unknown = sorted(
+            name
+            for name in requested
+            if name not in deterministic_set and name not in sample_set
+        )
+
+        if unknown:
+            warnings.warn(
+                "Ignoring unknown site name(s) in deterministic_sites: "
+                f"{unknown}. Available deterministic sites: "
+                f"{self.deterministic_site_names}",
+                stacklevel=2,
+            )
+
+        return selected
+
+    def get_deterministic_samples(self, posterior_samples, *, site_names):
+        site_names = self._normalize_requested_deterministic_sites(site_names)
+        if not site_names:
+            return {}
+
+        predictive = Predictive(
+            self.model,
+            posterior_samples=posterior_samples,
+            return_sites=site_names,
+        )
+        out = predictive(random.PRNGKey(
+            0), *self.model_args, **self.model_kwargs)
+        return {name: out[name] for name in site_names}
+
+    def get_deterministic_best_fit(self, *, site_names):
+        site_names = self._normalize_requested_deterministic_sites(site_names)
+        if not site_names:
+            return {}
+
+        best_fit = self.get_best_fit()
+        predictive = Predictive(
+            self.model,
+            posterior_samples={k: jnp.expand_dims(
+                v, axis=0) for k, v in best_fit.items()},
+            return_sites=site_names,
+        )
+        out = predictive(random.PRNGKey(
+            0), *self.model_args, **self.model_kwargs)
+        return {name: out[name][0] for name in site_names}
+
+    def summary(self, *, print_modes=True, make_idata=True, deterministic_sites=None):
         analyzer = self.get_analyzer()
 
         if print_modes:
             modes = analyzer.get_mode_stats()["modes"]
             for mode in modes:
                 print(f"\nMode {mode['index']} parameters:")
-                mu = _unflatten_theta_vector(np.asarray(mode["mean"]), self.site_info)
-                sd = _unflatten_theta_vector(np.asarray(mode["sigma"]), self.site_info)
+                mu = _unflatten_theta_vector(
+                    np.asarray(mode["mean"]), self.site_info)
+                sd = _unflatten_theta_vector(
+                    np.asarray(mode["sigma"]), self.site_info)
 
                 for name in self.site_names:
                     x = np.asarray(mu[name])
@@ -303,8 +404,35 @@ class MultiNestRunner:
         best_fit = self.get_best_fit()
         samples = self.get_equal_weighted_posterior()
 
+        if deterministic_sites is not None:
+            det_best_fit = self.get_deterministic_best_fit(
+                site_names=deterministic_sites)
+            det_samples = self.get_deterministic_samples(
+                samples, site_names=deterministic_sites)
+            best_fit = {**best_fit, **det_best_fit}
+            samples = {**samples, **det_samples}
+
+            if print_modes and det_samples:
+                print("\nDeterministic sites (posterior samples):")
+                for name, vals in det_samples.items():
+                    x = np.asarray(vals)
+                    mu = np.mean(x, axis=0)
+                    sd = np.std(
+                        x, axis=0, ddof=1) if x.shape[0] > 1 else np.zeros_like(mu)
+                    if mu.ndim == 0:
+                        print(
+                            f"    {name} = {float(mu):.6e} +- {float(sd):.6e}")
+                    else:
+                        for idx in np.ndindex(mu.shape):
+                            idx_str = ",".join(map(str, idx))
+                            print(
+                                f"    {name}[{idx_str}] = "
+                                f"{float(mu[idx]):.6e} +- {float(sd[idx]):.6e}"
+                            )
+
         idata = None
         if make_idata and az is not None:
-            idata = az.from_dict(posterior={k: v[None, ...] for k, v in samples.items()})
+            idata = az.from_dict(posterior={k: np.asarray(
+                v)[None, ...] for k, v in samples.items()})
 
         return best_fit, samples, idata
