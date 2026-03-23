@@ -7,7 +7,10 @@ import numpyro
 import numpyro.distributions as dist
 from numpyro.distributions.transforms import biject_to
 
-from numpyro_inferutils.fisher import information_from_model_independent_normal
+from numpyro_inferutils.fisher import (
+    hessian_from_model,
+    information_from_model_independent_normal,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +85,16 @@ def two_block_linear_gaussian_model(x1, x2, sigma1, sigma2, y1=None, y2=None):
 
     numpyro.sample("obs1", dist.Normal(mu1, sigma1), obs=y1)
     numpyro.sample("obs2", dist.Normal(mu2, sigma2), obs=y2)
+
+
+
+def linear_gaussian_model_observed(x, sigma, y):
+    """Linear Gaussian model with an observed site for Hessian tests."""
+    w = numpyro.sample("w", dist.Normal(0.0, 1.0))
+    b = numpyro.sample("b", dist.Normal(0.0, 1.0))
+    mu = w * x + b
+    numpyro.deterministic("mu", mu)
+    numpyro.sample("obs", dist.Normal(mu, sigma), obs=y)
 
 
 def analytic_fisher_two_block_linear(x1, sigma1, x2, sigma2):
@@ -360,3 +373,112 @@ def test_information_from_model_independent_normal_multiple_mu_shape_mismatch():
             rng_key=key,
             diff_mode="rev",
         )
+
+
+
+def test_information_from_model_independent_normal_ignores_extra_deterministic_pdic_entries():
+    """Extra deterministic entries in `pdic` must not freeze the model trace."""
+    key = random.PRNGKey(5)
+    x = jnp.linspace(-1.0, 1.0, 5)
+    sigma = 0.3
+    sigma_sd = jnp.full_like(x, sigma)
+
+    w0 = 1.5
+    b0 = -0.2
+    mu0 = w0 * x + b0
+    y_obs = mu0
+
+    pdic_sample_only = {"w": jnp.array(w0), "b": jnp.array(b0)}
+    pdic_with_deterministic = {
+        "w": jnp.array(w0),
+        "b": jnp.array(b0),
+        "mu": mu0,
+    }
+
+    info_sample_only = information_from_model_independent_normal(
+        model=linear_gaussian_model,
+        model_args=(x, sigma),
+        pdic=pdic_sample_only,
+        mu_name="mu",
+        observed=y_obs,
+        obs_name="obs",
+        keys=["w", "b"],
+        sigma_sd=sigma_sd,
+        param_space="constrained",
+        rng_key=key,
+        diff_mode="rev",
+    )
+
+    info_with_deterministic = information_from_model_independent_normal(
+        model=linear_gaussian_model,
+        model_args=(x, sigma),
+        pdic=pdic_with_deterministic,
+        mu_name="mu",
+        observed=y_obs,
+        obs_name="obs",
+        keys=["w", "b"],
+        sigma_sd=sigma_sd,
+        param_space="constrained",
+        rng_key=key,
+        diff_mode="rev",
+    )
+
+    F_expected = analytic_fisher_linear(x, sigma)
+    assert jnp.allclose(info_sample_only["fisher"], F_expected, rtol=1e-4, atol=1e-6)
+    assert jnp.allclose(
+        info_with_deterministic["fisher"],
+        info_sample_only["fisher"],
+        rtol=1e-5,
+        atol=1e-7,
+    )
+
+
+
+def test_hessian_from_model_ignores_extra_deterministic_pdic_entries():
+    """The Hessian helper should also ignore extra deterministic `pdic` entries."""
+    key = random.PRNGKey(6)
+    x = jnp.linspace(-1.0, 1.0, 5)
+    sigma = 0.3
+
+    w0 = 1.5
+    b0 = -0.2
+    mu0 = w0 * x + b0
+    y_obs = mu0
+
+    pdic_sample_only = {"w": jnp.array(w0), "b": jnp.array(b0)}
+    pdic_with_deterministic = {
+        "w": jnp.array(w0),
+        "b": jnp.array(b0),
+        "mu": mu0,
+    }
+
+    res_sample_only = hessian_from_model(
+        model=linear_gaussian_model_observed,
+        model_args=(x, sigma, y_obs),
+        pdic=pdic_sample_only,
+        keys=["w", "b"],
+        which="loglik",
+        param_space="constrained",
+        rng_key=key,
+        diff_mode="fwdrev",
+    )
+
+    res_with_deterministic = hessian_from_model(
+        model=linear_gaussian_model_observed,
+        model_args=(x, sigma, y_obs),
+        pdic=pdic_with_deterministic,
+        keys=["w", "b"],
+        which="loglik",
+        param_space="constrained",
+        rng_key=key,
+        diff_mode="fwdrev",
+    )
+
+    H_expected = -analytic_fisher_linear(x, sigma)
+    assert jnp.allclose(res_sample_only["hessian"], H_expected, rtol=1e-4, atol=1e-6)
+    assert jnp.allclose(
+        res_with_deterministic["hessian"],
+        res_sample_only["hessian"],
+        rtol=1e-5,
+        atol=1e-7,
+    )
