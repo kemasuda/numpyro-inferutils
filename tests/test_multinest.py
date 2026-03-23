@@ -58,6 +58,8 @@ def test_prior_returns_flat_vector_in_site_order():
 
 
 def test_gamma_prior_transform_is_supported():
+    pytest.importorskip("tensorflow_probability")
+
     runner = MultiNestRunner(gamma_model)
 
     theta = runner.prior(jnp.array([0.4]))

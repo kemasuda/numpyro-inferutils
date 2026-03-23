@@ -298,9 +298,9 @@ class MultiNestRunner:
         return self.result
 
     def get_analyzer(self):
-        _, Analyzer = _import_pymultinest()
         if self.outputfiles_basename is None:
             raise RuntimeError("run() must be called before analysis.")
+        _, Analyzer = _import_pymultinest()
         return Analyzer(n_params=self.ndim, outputfiles_basename=self.outputfiles_basename)
 
     def get_best_fit(self):
