@@ -23,7 +23,7 @@ def _import_pymultinest():
     except Exception as e:
         raise ImportError(
             "PyMultiNest is required for MultiNestRunner. "
-            "Install pymultinest and the MultiNest library."
+            "Install pymultinest library."
         ) from e
     return solve, Analyzer
 
