@@ -64,28 +64,34 @@ def _latent_sample_names(model, *, model_args=(), model_kwargs=None):
 
 def _prepare_param_dicts(model, pdic, keys, *, param_space, model_args=(), model_kwargs=None):
     """
-    Prepare full and differentiable parameter dicts in the requested parameter space.
+    Prepare full and differentiable latent-parameter dicts in the requested parameter space.
 
-    `pdic` is assumed to contain constrained values. When `param_space='unconstrained'`,
-    any latent sample sites present in `pdic` are mapped to unconstrained space.
-    Non-latent entries are kept as-is.
+    `pdic` is assumed to contain constrained values. Only latent sample sites are retained;
+    any extra entries such as deterministic sites are ignored so they do not get frozen by
+    `handlers.substitute(...)`. When `param_space='unconstrained'`, retained latent sample
+    sites are mapped to unconstrained space.
     """
     model_kwargs = {} if model_kwargs is None else model_kwargs
     keys = list(keys)
 
-    if param_space == "unconstrained":
-        latent_names = set(
-            _latent_sample_names(
-                model, model_args=model_args, model_kwargs=model_kwargs)
+    latent_names = set(
+        _latent_sample_names(
+            model,
+            model_args=model_args,
+            model_kwargs=model_kwargs,
         )
-        convert_keys = [k for k in pdic.keys() if k in latent_names]
+    )
+    pdic_latent = OrderedDict((k, v) for k, v in pdic.items() if k in latent_names)
+
+    if param_space == "unconstrained":
+        convert_keys = list(pdic_latent.keys())
         converted = _to_unconstrained(
-            model, pdic, convert_keys, *model_args, **model_kwargs
+            model, pdic_latent, convert_keys, *model_args, **model_kwargs
         ) if len(convert_keys) > 0 else {}
-        pdic_all = dict(pdic)
+        pdic_all = dict(pdic_latent)
         pdic_all.update(converted)
     elif param_space == "constrained":
-        pdic_all = dict(pdic)
+        pdic_all = dict(pdic_latent)
     else:
         raise ValueError(
             "param_space must be 'constrained' or 'unconstrained'.")
@@ -320,7 +326,8 @@ def information_from_model_independent_normal(
     Args:
         model: NumPyro model.
         model_args, model_kwargs: static args/kwargs for the model.
-        pdic: dict of parameter values in constrained space.
+        pdic: dict of parameter values in constrained space. Extra non-latent
+            entries are ignored.
         mu_name: deterministic site name(s) for the model mean. Multiple names
             are flattened and concatenated.
         observed: 1D array or blockwise list/tuple of observed values; `obs_name`
@@ -345,8 +352,8 @@ def information_from_model_independent_normal(
             - "col_slices" (dict[str, slice]): Mapping from each parameter name
               to its corresponding column range in the Fisher matrix.
             - "col_names" (list[str]): Flattened per-column names.
-            - "params_unconstrained" (dict[str, jnp.ndarray]): Parameter values
-              in the requested differentiation space used internally.
+            - "params_unconstrained" (dict[str, jnp.ndarray]): Latent parameter
+              values in the requested differentiation space used internally.
     """
     assert (
         model is not None
@@ -425,7 +432,8 @@ def hessian_from_model(
     Args:
         model: NumPyro model.
         model_args, model_kwargs: static args/kwargs for the model.
-        pdic: dict of parameter values in constrained space.
+        pdic: dict of parameter values in constrained space. Extra non-latent
+            entries are ignored.
         keys: list of parameter names to differentiate (order preserved).
         which: {'loglik', 'logprior', 'logprob'}
             Target scalar objective whose Hessian is computed.
@@ -443,8 +451,8 @@ def hessian_from_model(
             - "col_slices" (dict[str, slice]): Mapping from each parameter name
               to its corresponding column range.
             - "col_names" (list[str]): Flattened per-column names.
-            - "params_unconstrained" (dict[str, jnp.ndarray]): Parameter values
-              in the requested differentiation space used internally.
+            - "params_unconstrained" (dict[str, jnp.ndarray]): Latent parameter
+              values in the requested differentiation space used internally.
     """
     assert model is not None and pdic is not None and keys is not None
 
