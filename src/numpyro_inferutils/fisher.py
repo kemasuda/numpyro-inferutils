@@ -4,7 +4,7 @@ import jax.numpy as jnp
 from jax import jacfwd, jacrev, random
 from numpyro import handlers
 
-from .transforms import _seed_and_substitute, _to_unconstrained
+from .transforms import _seed_and_substitute, _to_unconstrained, _trace_at_constrained_params
 
 
 def _as_list(x):
@@ -49,11 +49,11 @@ def _trace_model(model, params_dict, param_space, rng_key, *, model_args=(), mod
     return handlers.trace(seeded).get_trace(*model_args, **model_kwargs)
 
 
-def _latent_sample_names(model, *, model_args=(), model_kwargs=None):
-    """Return non-observed sample-site names in the model trace."""
+def _latent_sample_names(model, pdic, *, model_args=(), model_kwargs=None):
+    """Return latent sample-site names from a trace at the supplied values."""
     model_kwargs = {} if model_kwargs is None else model_kwargs
-    tr = handlers.trace(handlers.seed(model, random.PRNGKey(0))).get_trace(
-        *model_args, **model_kwargs
+    tr = _trace_at_constrained_params(
+        model, pdic, *model_args, **model_kwargs
     )
     return [
         name
@@ -77,6 +77,7 @@ def _prepare_param_dicts(model, pdic, keys, *, param_space, model_args=(), model
     latent_names = set(
         _latent_sample_names(
             model,
+            pdic,
             model_args=model_args,
             model_kwargs=model_kwargs,
         )
