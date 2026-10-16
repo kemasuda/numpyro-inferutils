@@ -4,19 +4,35 @@ from numpyro import handlers, infer
 from numpyro.distributions.transforms import biject_to
 
 
+def _trace_at_constrained_params(model, params_constrained, *model_args, **model_kwargs):
+    """Discover sites at supplied latent values, recomputing deterministic sites."""
+    def substitute_latent(site):
+        if site["type"] == "sample" and not site["is_observed"]:
+            return params_constrained.get(site["name"])
+        return None
+
+    substituted = handlers.substitute(model, substitute_fn=substitute_latent)
+    return handlers.trace(
+        handlers.seed(substituted, random.PRNGKey(0))
+    ).get_trace(*model_args, **model_kwargs)
+
+
 def to_unconstrained_dict(model, params_constrained, keys, *model_args, **model_kwargs):
     """
     Convert constrained parameter values into unconstrained representations
     using the model's sample-site supports.
 
-    The model is run once under `handlers.trace` to inspect sample sites,
-    bijectors are constructed from `site["fn"].support`, and the inverse
-    transform is applied to the supplied constrained values.
+    The model is traced at the supplied constrained latent values to inspect
+    sample-site supports, including bounds that depend on other parameters.
+    Bijectors are constructed from `site["fn"].support`, and the inverse
+    transform is applied to the requested values. Extra deterministic and
+    observed entries are ignored; unspecified latent sites are sampled.
 
     Args:
         model (callable): NumPyro model function.
         params_constrained (dict): Mapping from parameter names to constrained
-            values (e.g., positive scales, simplex).
+            values (e.g., positive scales, simplex). Include parameters on which
+            the requested sites' supports depend, even if they are not in `keys`.
         keys (iterable[str]): Parameter names to convert into unconstrained space.
         *model_args: Positional arguments passed to `model` when tracing.
         **model_kwargs: Keyword arguments passed to `model` when tracing.
@@ -28,9 +44,9 @@ def to_unconstrained_dict(model, params_constrained, keys, *model_args, **model_
     Raises:
         KeyError: If a key in `keys` does not correspond to a sample site.
     """
-    tr = handlers.trace(
-        handlers.seed(model, random.PRNGKey(0))
-    ).get_trace(*model_args, **model_kwargs)
+    tr = _trace_at_constrained_params(
+        model, params_constrained, *model_args, **model_kwargs
+    )
 
     bij = {}
     for name, site in tr.items():
